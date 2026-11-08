@@ -517,16 +517,20 @@ def remote_load_library(hproc, pid, modules, dll):
 
 
 def resolve_fn(hproc, modules, dll, name=None, ordinal=None):
-    """Адрес импорта: для api-ms-* перебираем реальные хосты."""
+    """Адрес импорта. Для api-ms-* ищем экспорт во всех модулях процесса:
+    api-set может жить в combase, ucrtbase, kernelbase, ole32 и т.д."""
     if not is_api_set(dll):
         return remote_get_proc(hproc, modules, dll, name=name, ordinal=ordinal)
+    hosts = [h for h in API_SET_HOSTS if h in modules] + \
+            [m for m in modules if m not in API_SET_HOSTS and m.endswith(".dll")]
     last = None
-    for host in API_SET_HOSTS:
+    for host in hosts:
         try:
             return remote_get_proc(hproc, modules, host, name=name, ordinal=ordinal)
         except RuntimeError as e:
             last = e
-    raise last
+    raise RuntimeError("api-set %s: экспорт не найден ни в одном модуле процесса (%s)"
+                       % (dll, last))
 
 
 def resolve_imports(img, pe, hproc, pid, remote_modules):
