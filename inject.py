@@ -483,7 +483,53 @@ def cstring(img, offset):
     return img[offset:end].decode("ascii", "replace")
 
 
-def resolve_imports(img, pe, hproc, remote_modules):
+API_SET_HOSTS = ("ucrtbase.dll", "kernelbase.dll", "kernel32.dll")
+
+
+def is_api_set(dll):
+    low = dll.lower()
+    return low.startswith("api-ms-") or low.startswith("ext-ms-")
+
+
+def remote_load_library(hproc, pid, modules, dll):
+    """Подгружает DLL в целевой процесс через LoadLibraryA из его kernel32."""
+    load_fn = remote_get_proc(hproc, modules, "kernel32.dll", name="LoadLibraryA")
+    data = dll.encode("ascii") + b"\0"
+    mem = kernel32.VirtualAllocEx(hproc, None, len(data),
+                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    if not mem:
+        raise RuntimeError("VirtualAllocEx под имя DLL: %d" % ctypes.get_last_error())
+    try:
+        written = ctypes.c_size_t()
+        buf = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        if not kernel32.WriteProcessMemory(hproc, mem, buf, len(data),
+                                           ctypes.byref(written)):
+            raise RuntimeError("WriteProcessMemory под имя DLL: %d"
+                               % ctypes.get_last_error())
+        call_remote(hproc, mem, 0, 0, load_fn)
+    finally:
+        kernel32.VirtualFreeEx(hproc, mem, 0, MEM_RELEASE)
+    modules.update(enum_modules(pid))
+    if not find_remote_module(modules, dll):
+        raise RuntimeError("не удалось загрузить %s в процесс "
+                           "(нет в системе или не хватает зависимостей; "
+                           "поставь VC++ 2015-2022 x64 redistributable)" % dll)
+
+
+def resolve_fn(hproc, modules, dll, name=None, ordinal=None):
+    """Адрес импорта: для api-ms-* перебираем реальные хосты."""
+    if not is_api_set(dll):
+        return remote_get_proc(hproc, modules, dll, name=name, ordinal=ordinal)
+    last = None
+    for host in API_SET_HOSTS:
+        try:
+            return remote_get_proc(hproc, modules, host, name=name, ordinal=ordinal)
+        except RuntimeError as e:
+            last = e
+    raise last
+
+
+def resolve_imports(img, pe, hproc, pid, remote_modules):
     rva, size = pe.dirs[1]
     if not rva or not size:
         return
@@ -498,8 +544,8 @@ def resolve_imports(img, pe, hproc, remote_modules):
         if not name_rva:
             break
         dll = cstring(img, name_rva)
-        if not find_remote_module(remote_modules, dll):
-            raise RuntimeError("в целевом процессе нет модуля " + dll)
+        if not is_api_set(dll) and not find_remote_module(remote_modules, dll):
+            remote_load_library(hproc, pid, remote_modules, dll)
 
         thunk_off = oft or ft
         while thunk_off + 8 <= len(img):
@@ -507,12 +553,11 @@ def resolve_imports(img, pe, hproc, remote_modules):
             if not value:
                 break
             if value & 0x8000000000000000:
-                remote_fn = remote_get_proc(
-                    hproc, remote_modules, dll, ordinal=value & 0xFFFF)
+                remote_fn = resolve_fn(hproc, remote_modules, dll,
+                                       ordinal=value & 0xFFFF)
             else:
-                remote_fn = remote_get_proc(
-                    hproc, remote_modules, dll,
-                    name=cstring(img, value + 2))
+                remote_fn = resolve_fn(hproc, remote_modules, dll,
+                                       name=cstring(img, value + 2))
             struct.pack_into("<Q", img, ft, remote_fn)
 
             thunk_off += 8
@@ -607,7 +652,7 @@ def manual_map(pid, raw):
         remote_modules = enum_modules(pid)
         if not remote_modules:
             raise RuntimeError("не удалось перечислить модули процесса")
-        resolve_imports(img, pe, hproc, remote_modules)
+        resolve_imports(img, pe, hproc, pid, remote_modules)
 
         written = ctypes.c_size_t()
         buf = (ctypes.c_ubyte * len(img)).from_buffer(img)
