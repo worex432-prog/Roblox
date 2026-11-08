@@ -312,23 +312,25 @@ def find_remote_module(modules, name):
     return 0
 
 
-def remote_get_proc(hproc, modules, dll_name, name=None, ordinal=None,
-                    depth=0):
-    """Адрес экспорта, прочитанный из PE-образа модуля в целевом процессе."""
-    if depth > 8:
-        raise RuntimeError("слишком длинная цепочка forwarder-ов")
-    base = find_remote_module(modules, dll_name)
-    if not base:
-        raise RuntimeError("в целевом процессе нет модуля " + dll_name)
+# Куда реально смотрит api-set. combase.dll — хост для api-ms-win-core-com-l1-*:
+# именно в него форвардит почти все COM-функции ole32.dll на Windows 10/11.
+API_SET_PREFERRED_HOSTS = ("combase.dll", "ucrtbase.dll", "kernelbase.dll",
+                           "kernel32.dll", "ole32.dll")
 
+# api-set -> найденный реальный модуль, чтобы не сканировать всё на каждый импорт.
+_API_SET_CACHE = {}
+
+
+def _module_export(hproc, base, name=None, ordinal=None):
+    """Экспорт внутри модуля по его базе: (rva, forwarder или None)."""
     e_lfanew = struct.unpack_from("<I", read_remote(hproc, base, 0x40), 0x3C)[0]
     nt = read_remote(hproc, base + e_lfanew, 4 + 20 + 240)
     if nt[:4] != b"PE\0\0":
-        raise RuntimeError("битый PE у модуля " + dll_name)
+        raise RuntimeError("битый PE")
     opt = 24
     export_rva, export_size = struct.unpack_from("<II", nt, opt + 112)
     if not export_rva:
-        raise RuntimeError("у модуля " + dll_name + " нет таблицы экспорта")
+        raise RuntimeError("нет таблицы экспорта")
 
     ed = read_remote(hproc, base + export_rva, 40)
     ordinal_base = struct.unpack_from("<I", ed, 16)[0]
@@ -347,25 +349,83 @@ def remote_get_proc(hproc, modules, dll_name, name=None, ordinal=None,
                 index = struct.unpack_from(
                     "<H", read_remote(hproc, base + addr_ords + 2 * i, 2))[0]
                 break
+        if index is None:
+            raise RuntimeError("нет экспорта " + name)
     elif ordinal is not None:
         index = ordinal - ordinal_base
     if index is None or index >= num_funcs:
-        what = name if name is not None else ("#%d" % ordinal)
-        raise RuntimeError("экспорт %s не найден в %s" % (what, dll_name))
+        raise RuntimeError("экспорт вне таблицы")
 
     func_rva = struct.unpack_from(
         "<I", read_remote(hproc, base + addr_funcs + 4 * index, 4))[0]
     if export_rva <= func_rva < export_rva + export_size:
-        forwarder = read_remote_cstring(hproc, base + func_rva)
-        if "." not in forwarder:
-            raise RuntimeError("битый forwarder: " + forwarder)
-        target_dll, target_fn = forwarder.rsplit(".", 1)
-        if target_fn.startswith("#"):
-            return remote_get_proc(hproc, modules, target_dll,
-                                   ordinal=int(target_fn[1:]), depth=depth + 1)
-        return remote_get_proc(hproc, modules, target_dll,
-                               name=target_fn, depth=depth + 1)
-    return base + func_rva
+        return func_rva, read_remote_cstring(hproc, base + func_rva)
+    return func_rva, None
+
+
+def remote_api_set(hproc, modules, apiset, name=None, ordinal=None, depth=0,
+                   seen=None):
+    """api-set — виртуальное имя: ищем тот же экспорт в реальном модуле."""
+    if seen is None:
+        seen = set()
+    key = (apiset.lower(), name if name is not None else ("#%d" % ordinal))
+    if key in seen:
+        raise RuntimeError("цикл через " + apiset)
+    seen.add(key)
+
+    cached = _API_SET_CACHE.get(apiset.lower())
+    if cached and find_remote_module(modules, cached):
+        hosts = [cached]
+    else:
+        hosts = [h for h in API_SET_PREFERRED_HOSTS
+                 if find_remote_module(modules, h)]
+        hosts += [m for m in modules if m not in hosts and m.endswith(".dll")]
+
+    last = None
+    for host in hosts:
+        try:
+            addr = remote_get_proc(hproc, modules, host, name=name,
+                                   ordinal=ordinal, depth=depth + 1,
+                                   seen=seen)
+        except RuntimeError as e:
+            last = e
+            continue
+        _API_SET_CACHE[apiset.lower()] = host
+        return addr
+
+    what = name if name is not None else ("#%d" % ordinal)
+    raise RuntimeError("api-set %s: %s не найден ни в одном модуле процесса (%s)"
+                       % (apiset, what, last))
+
+
+def remote_get_proc(hproc, modules, dll_name, name=None, ordinal=None,
+                    depth=0, seen=None):
+    """Адрес экспорта, прочитанный из PE-образа модуля в целевом процессе."""
+    if depth > 8:
+        raise RuntimeError("слишком длинная цепочка forwarder-ов")
+    base = find_remote_module(modules, dll_name)
+    if not base:
+        if is_api_set(dll_name):
+            return remote_api_set(hproc, modules, dll_name, name=name,
+                                  ordinal=ordinal, depth=depth, seen=seen)
+        raise RuntimeError("в целевом процессе нет модуля " + dll_name)
+
+    func_rva, forwarder = _module_export(hproc, base, name=name, ordinal=ordinal)
+    if forwarder is None:
+        return base + func_rva
+
+    if "." not in forwarder:
+        raise RuntimeError("битый forwarder: " + forwarder)
+    target_dll, target_fn = forwarder.rsplit(".", 1)
+    target_ord = int(target_fn[1:]) if target_fn.startswith("#") else None
+    target_name = None if target_ord is not None else target_fn
+
+    if not find_remote_module(modules, target_dll):
+        # api-set или ещё не загруженный модуль: ищем реализацию по имени.
+        return remote_api_set(hproc, modules, target_dll, name=target_name,
+                              ordinal=target_ord, depth=depth, seen=seen)
+    return remote_get_proc(hproc, modules, target_dll, name=target_name,
+                           ordinal=target_ord, depth=depth + 1, seen=seen)
 
 
 def section_protection(chars):
@@ -483,7 +543,7 @@ def cstring(img, offset):
     return img[offset:end].decode("ascii", "replace")
 
 
-API_SET_HOSTS = ("ucrtbase.dll", "kernelbase.dll", "kernel32.dll")
+API_SET_HOSTS = API_SET_PREFERRED_HOSTS
 
 
 def is_api_set(dll):
