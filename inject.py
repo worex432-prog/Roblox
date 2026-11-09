@@ -7,7 +7,7 @@ inject.py - самостоятельный Python-инжектор x64 DLL в п
   * DLL можно скачать по http(s):// или прочитать с диска;
   * образ PE разбирается в памяти;
   * ручной маппинг: VirtualAllocEx, релокации, импорты, TLS, DllMain;
-  * LoadLibraryW по файлу не используется, на диск ничего не пишется.
+  * Overlay loading uses LoadLibraryW and a cached DLL on disk.
 
 Требования:
   * 64-битный Python;
@@ -787,9 +787,77 @@ def download(url, max_bytes=256 * 1024 * 1024):
     return data
 
 
+def load_overlay(pid, raw):
+    """Use the Windows loader: the overlay needs module registration and resources."""
+    import hashlib
+    import tempfile
+    from pathlib import Path
+
+    if len(raw) < 64 or raw[:2] != b"MZ":
+        raise ValueError("Expected an x64 DLL, not an HTML download page")
+    pe = struct.unpack_from("<I", raw, 60)[0]
+    if (pe + 26 > len(raw) or raw[pe:pe + 4] != b"PE\0\0" or
+            struct.unpack_from("<H", raw, pe + 4)[0] != 0x8664 or
+            not struct.unpack_from("<H", raw, pe + 22)[0] & 0x2000 or
+            struct.unpack_from("<H", raw, pe + 24)[0] != 0x20b):
+        raise ValueError("Expected a valid x64 Windows DLL")
+    folder = Path(tempfile.gettempdir()) / "OpenGLOverlay" / hashlib.sha256(raw).hexdigest()
+    folder.mkdir(parents=True, exist_ok=True)
+    dll = folder / "overlay.dll"
+    if not dll.exists() or dll.read_bytes() != raw:
+        dll.write_bytes(raw)
+    print("[*] DLL cache: %s" % dll, flush=True)
+    hproc = kernel32.OpenProcess(
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, False, pid)
+    if not hproc:
+        raise RuntimeError("OpenProcess failed: %d" % ctypes.get_last_error())
+    memory = None
+    thread = None
+    safe_to_free = True
+    try:
+        wow = wt.BOOL(0)
+        if not kernel32.IsWow64Process(hproc, ctypes.byref(wow)) or wow.value:
+            raise RuntimeError("Target must be a readable x64 process")
+        modules = enum_modules(pid)
+        if "overlay.dll" in modules:
+            raise RuntimeError("An overlay is already loaded; restart Minecraft before retrying")
+        load_fn = remote_get_proc(hproc, modules, "kernel32.dll", name="LoadLibraryW")
+        if not load_fn:
+            raise RuntimeError("Cannot resolve target LoadLibraryW")
+        data = (str(dll.resolve()) + "\0").encode("utf-16-le")
+        memory = kernel32.VirtualAllocEx(hproc, None, len(data),
+                                        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        if not memory:
+            raise RuntimeError("VirtualAllocEx failed: %d" % ctypes.get_last_error())
+        written = ctypes.c_size_t()
+        buffer = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
+        if (not kernel32.WriteProcessMemory(hproc, memory, buffer, len(data), ctypes.byref(written))
+                or written.value != len(data)):
+            raise RuntimeError("Could not write the DLL path")
+        thread = kernel32.CreateRemoteThread(hproc, None, 0, load_fn, memory, 0, None)
+        if not thread:
+            raise RuntimeError("CreateRemoteThread failed: %d" % ctypes.get_last_error())
+        safe_to_free = False
+        wait = kernel32.WaitForSingleObject(thread, 15000)
+        if wait != 0:
+            raise RuntimeError("DLL load did not finish (wait=0x%X); restart Minecraft before retrying" % wait)
+        safe_to_free = True
+        # Thread exit codes truncate x64 module handles. Verify module registration instead.
+        if "overlay.dll" not in enum_modules(pid):
+            raise RuntimeError("Windows could not load the DLL; check x64 VC++ runtime dependencies")
+        print("[+] DLL loaded through Windows. Focus Minecraft and press Right Shift.")
+    finally:
+        if thread:
+            kernel32.CloseHandle(thread)
+        if memory and safe_to_free:
+            kernel32.VirtualFreeEx(hproc, memory, 0, MEM_RELEASE)
+        kernel32.CloseHandle(hproc)
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Python-инжектор x64 DLL (ручной маппинг в память)")
+        description="Load the x64 overlay through the Windows loader")
     src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--url", help="скачать DLL по http(s)://")
     src.add_argument("--dll", help="локальный путь к DLL")
@@ -831,7 +899,7 @@ def main():
             with open(dll, "rb") as f:
                 raw = f.read()
         print("[*] Получено %d байт" % len(raw))
-        manual_map(pid, raw)
+        load_overlay(pid, raw)
     except (ValueError, RuntimeError, OSError) as e:
         die(str(e))
 
