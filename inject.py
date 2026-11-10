@@ -864,8 +864,6 @@ def main():
     src.add_argument("--url", help="скачать DLL по http(s)://")
     src.add_argument("--dll", help="локальный путь к DLL")
     ap.add_argument("--pid", type=int, help="PID целевого процесса")
-    ap.add_argument("--refresh", action="store_true",
-                    help="Download the DLL again instead of using the cached file")
     ap.add_argument("--process", help="имя процесса, например javaw.exe")
     args = ap.parse_args()
 
@@ -897,13 +895,8 @@ def main():
 
     try:
         if url:
-            cached = cache_path()
-            if cached.exists() and not args.refresh:
-                print("[*] Local DLL: %s" % cached)
-                raw = cached.read_bytes()
-            else:
-                print("[*] Downloading %s" % url)
-                raw = download(url)
+            print("[*] Downloading %s" % url)
+            raw = download(url)
         else:
             with open(dll, "rb") as f:
                 raw = f.read()
