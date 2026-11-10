@@ -787,10 +787,16 @@ def download(url, max_bytes=256 * 1024 * 1024):
     return data
 
 
+def cache_path():
+    """Fixed DLL location: OVERLAY_DLL_DIR overrides %LOCALAPPDATA%\OpenGLOverlay."""
+    from pathlib import Path
+    folder = Path(os.environ.get("OVERLAY_DLL_DIR") or
+                  Path(os.environ["LOCALAPPDATA"]) / "OpenGLOverlay")
+    return folder / "overlay.dll"
+
+
 def load_overlay(pid, raw):
     """Use the Windows loader: the overlay needs module registration and resources."""
-    from pathlib import Path
-
     if len(raw) < 64 or raw[:2] != b"MZ":
         raise ValueError("Expected an x64 DLL, not an HTML download page")
     pe = struct.unpack_from("<I", raw, 60)[0]
@@ -799,11 +805,7 @@ def load_overlay(pid, raw):
             not struct.unpack_from("<H", raw, pe + 22)[0] & 0x2000 or
             struct.unpack_from("<H", raw, pe + 24)[0] != 0x20b):
         raise ValueError("Expected a valid x64 Windows DLL")
-    # Fixed cache folder: override with OVERLAY_DLL_DIR, default %LOCALAPPDATA%\OpenGLOverlay.
-    folder = Path(os.environ.get("OVERLAY_DLL_DIR") or
-                  Path(os.environ["LOCALAPPDATA"]) / "OpenGLOverlay")
-    folder.mkdir(parents=True, exist_ok=True)
-    dll = folder / "overlay.dll"
+    dll = cache_path()
     if not dll.exists() or dll.read_bytes() != raw:
         dll.write_bytes(raw)
     print("[*] DLL cache: %s" % dll, flush=True)
@@ -862,6 +864,8 @@ def main():
     src.add_argument("--url", help="скачать DLL по http(s)://")
     src.add_argument("--dll", help="локальный путь к DLL")
     ap.add_argument("--pid", type=int, help="PID целевого процесса")
+    ap.add_argument("--refresh", action="store_true",
+                    help="Download the DLL again instead of using the cached file")
     ap.add_argument("--process", help="имя процесса, например javaw.exe")
     args = ap.parse_args()
 
@@ -893,8 +897,13 @@ def main():
 
     try:
         if url:
-            print("[*] Скачиваю %s" % url)
-            raw = download(url)
+            cached = cache_path()
+            if cached.exists() and not args.refresh:
+                print("[*] Local DLL: %s" % cached)
+                raw = cached.read_bytes()
+            else:
+                print("[*] Downloading %s" % url)
+                raw = download(url)
         else:
             with open(dll, "rb") as f:
                 raw = f.read()
