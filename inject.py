@@ -789,8 +789,6 @@ def download(url, max_bytes=256 * 1024 * 1024):
 
 def load_overlay(pid, raw):
     """Use the Windows loader: the overlay needs module registration and resources."""
-    import hashlib
-    import tempfile
     from pathlib import Path
 
     if len(raw) < 64 or raw[:2] != b"MZ":
@@ -801,7 +799,9 @@ def load_overlay(pid, raw):
             not struct.unpack_from("<H", raw, pe + 22)[0] & 0x2000 or
             struct.unpack_from("<H", raw, pe + 24)[0] != 0x20b):
         raise ValueError("Expected a valid x64 Windows DLL")
-    folder = Path(tempfile.gettempdir()) / "OpenGLOverlay" / hashlib.sha256(raw).hexdigest()
+    # Fixed cache folder: override with OVERLAY_DLL_DIR, default %LOCALAPPDATA%\OpenGLOverlay.
+    folder = Path(os.environ.get("OVERLAY_DLL_DIR") or
+                  Path(os.environ["LOCALAPPDATA"]) / "OpenGLOverlay")
     folder.mkdir(parents=True, exist_ok=True)
     dll = folder / "overlay.dll"
     if not dll.exists() or dll.read_bytes() != raw:
@@ -846,7 +846,7 @@ def load_overlay(pid, raw):
         # Thread exit codes truncate x64 module handles. Verify module registration instead.
         if "overlay.dll" not in enum_modules(pid):
             raise RuntimeError("Windows could not load the DLL; check x64 VC++ runtime dependencies")
-        print("[+] DLL loaded through Windows. Focus Minecraft and press Right Shift.")
+        print("[+] DLL loaded through Windows. Focus Minecraft and press Ctrl + Right Shift.")
     finally:
         if thread:
             kernel32.CloseHandle(thread)
