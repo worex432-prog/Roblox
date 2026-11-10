@@ -1,18 +1,22 @@
-"""Load a GitHub-hosted DLL through the project's existing Windows injector.
+"""Load the overlay DLL straight into a running process memory.
 
-This uses a temporary DLL on disk: LoadLibraryW cannot load an HTTPS URL or
-a Python byte buffer. The file may remain locked until the overlay is unloaded.
+The DLL is never written to disk. It is read from a local file (or downloaded
+into memory when --url is used) and piped to injector.exe --stdin, which maps
+it into the target by hand and calls its entry point.
+
+Usage:
+    python inject.py javaw.exe
+    python inject.py javaw.exe --dll payload.dll
+    python inject.py javaw.exe --url https://raw.githubusercontent.com/.../payload.dll --sha256 <64 hex>
 """
 import argparse
 import hashlib
 import os
 from pathlib import Path
 import re
-import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
@@ -37,7 +41,7 @@ def sha256_value(value):
 
 def validate_dll(data):
     if len(data) < 64 or data[:2] != b"MZ":
-        raise ValueError("The response is not a PE DLL (possibly a GitHub HTML page).")
+        raise ValueError("The payload is not a PE DLL (possibly a GitHub HTML page).")
     pe = struct.unpack_from("<I", data, 0x3C)[0]
     if pe < 64 or pe + 26 > len(data) or data[pe:pe + 4] != b"PE\0\0":
         raise ValueError("Invalid PE header.")
@@ -56,7 +60,7 @@ def download(url, expected_hash):
         data = response.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
         raise ValueError("DLL exceeds the 32 MiB limit.")
-    if hashlib.sha256(data).hexdigest() != expected_hash:
+    if expected_hash and hashlib.sha256(data).hexdigest() != expected_hash:
         raise ValueError("SHA-256 mismatch; injection cancelled.")
     validate_dll(data)
     return data
@@ -65,6 +69,7 @@ def download(url, expected_hash):
 def find_injector(explicit):
     root = Path(__file__).resolve().parent
     candidates = [Path(explicit)] if explicit else [
+        root / "injector.exe",
         root / "outputs" / "injector.exe",
         root / "build" / "Release" / "injector.exe",
     ]
@@ -76,39 +81,40 @@ def find_injector(explicit):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Download a GitHub DLL to a temporary file and use injector.exe.",
-        epilog="This is NOT a diskless loader. Unload the DLL before removing its temporary file.")
+        description="Map payload.dll into a target process without writing the DLL to disk.",
+        epilog="The DLL bytes are streamed to injector.exe on stdin and mapped in memory.")
     parser.add_argument("target", help="Target PID or process name, e.g. javaw.exe")
-    parser.add_argument("url", type=github_url, help="Direct public GitHub DLL download URL")
-    parser.add_argument("--sha256", required=True, type=sha256_value,
-                        help="SHA-256 of the exact DLL you published")
-    parser.add_argument("--injector", help="Path to this project's x64 injector.exe")
+    parser.add_argument("--dll", help="Local DLL to load (default: payload.dll next to this script)")
+    parser.add_argument("--url", type=github_url, help="Optional HTTPS URL to download the DLL into memory")
+    parser.add_argument("--sha256", type=sha256_value, help="SHA-256 of the downloaded DLL (with --url)")
+    parser.add_argument("--injector", help="Path to injector.exe")
     args = parser.parse_args(argv)
-    temporary = None
     try:
         if os.name != "nt":
             raise OSError("This loader requires Windows.")
         if not args.target.strip() or args.target.startswith("-"):
             raise ValueError("Provide a PID or process name.")
         injector = find_injector(args.injector)
-        data = download(args.url, args.sha256)
-        temporary = Path(tempfile.mkdtemp(prefix="OpenGLOverlay-"))
-        dll = temporary / "overlay.dll"
-        dll.write_bytes(data)
-        print("Temporary DLL: " + str(dll), flush=True)
-        # No timeout here: the native injector owns its remote-thread wait.
-        result = subprocess.run([str(injector), args.target, str(dll)], check=False)
+
+        if args.url:
+            data = download(args.url, args.sha256)
+        else:
+            path = Path(args.dll) if args.dll else Path(__file__).resolve().parent / "payload.dll"
+            if not path.is_file():
+                raise FileNotFoundError("DLL not found: " + str(path) + " (pass --dll PATH)")
+            data = path.read_bytes()
+            if len(data) > MAX_BYTES:
+                raise ValueError("DLL exceeds the 32 MiB limit.")
+            validate_dll(data)
+        print("Loaded " + str(len(data)) + " bytes from memory; no DLL file is written.", flush=True)
+
+        # The native injector owns its remote-thread wait, so no timeout here.
+        result = subprocess.run([str(injector), args.target, "--stdin"],
+                                input=data, check=False)
         return result.returncode
     except (OSError, ValueError) as error:
         print("Error: " + str(error), file=sys.stderr)
         return 1
-    finally:
-        if temporary is not None:
-            try:
-                shutil.rmtree(temporary)
-            except OSError:
-                print("Temporary files remain at " + str(temporary) +
-                      "; remove this folder after unloading the DLL.", file=sys.stderr)
 
 
 if __name__ == "__main__":
