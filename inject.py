@@ -788,7 +788,7 @@ def download(url, max_bytes=256 * 1024 * 1024):
 
 
 def cache_path():
-    """Fixed DLL location: OVERLAY_DLL_DIR overrides %LOCALAPPDATA%\OpenGLOverlay."""
+    r"""Fixed DLL location: OVERLAY_DLL_DIR overrides %LOCALAPPDATA%\OpenGLOverlay."""
     from pathlib import Path
     folder = Path(os.environ.get("OVERLAY_DLL_DIR") or
                   Path(os.environ["LOCALAPPDATA"]) / "OpenGLOverlay")
