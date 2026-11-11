@@ -46,7 +46,7 @@ type payload.dll | injector.exe 12345 --stdin
 
 | Feature | Key | Mode | Details |
 | --- | --- | --- | --- |
-| Triggerbot | `L` | Hold | click delay 50–60 ms |
+| Triggerbot | `L` | Hold | click delay 50–75 ms |
 | Aim Assist | `L` | Hold | Legit, FOV 30, range 3.5, smoothing 100, random speed on, Y 50–70, X 200–300 |
 | Crystal Spam | RMB | Hold | |
 | Friend Add | `N` | Toggle | enabled by default, radius 8 |
