@@ -859,5 +859,7 @@ def main():
         die(str(e))
 
 
-if __name__ == "__main__":
+# Автозапуска нет: при exec() по URL скрипт только объявляет функции.
+# Запуск из консоли (python inject.py ...) по-прежнему работает.
+if __name__ == "__main__" and "__file__" in globals():
     main()
