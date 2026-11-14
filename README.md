@@ -46,8 +46,8 @@ type payload.dll | injector.exe 12345 --stdin
 
 | Feature | Key | Mode | Details |
 | --- | --- | --- | --- |
-| Triggerbot | `L` | Hold | click delay 50-75 ms, hold 160-200 ms |
-| Aim Assist | `L` | Hold | Legit, FOV 30, range 3.5, smoothing 100, random speed on, Y 50–70, X 200–300 |
+| Triggerbot | `Z` | Toggle | while the module is on, holding LMB attacks the target under the crosshair; click delay 50-75 ms |
+| Aim Assist | `X` | Toggle | Legit, FOV 30, range 3.5, smoothing 100 ms, random speed on, X 70-100, Y 50-70, aim only after a hit (2 s window), keep target 3 s |
 | Crystal Spam | RMB | Hold | |
 | Friend Add | `N` | Toggle | enabled by default, radius 8 |
 | GUI | `Ctrl + Right Shift` | – | opens/closes the menu |
