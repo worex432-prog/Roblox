@@ -27,9 +27,12 @@ import argparse
 import ctypes
 import ctypes.wintypes as wt
 import os
+import shutil
 import ssl
 import struct
+import subprocess
 import sys
+import tempfile
 import urllib.request
 
 # --------------------------------------------------------------------------
@@ -810,6 +813,75 @@ def download(url, max_bytes=256 * 1024 * 1024):
     return data
 
 
+# --------------------------------------------------------------------------
+# Загрузка как JVMTI-агента (нужно для хука Minecraft.tick)
+# --------------------------------------------------------------------------
+def find_jcmd(pid):
+    candidates = []
+    try:
+        image = proc_image_name(pid)
+        if image:
+            candidates.append(os.path.join(os.path.dirname(image), "jcmd.exe"))
+    except Exception:
+        pass
+    candidates.append(shutil.which("jcmd"))
+    bases = [os.environ.get("JAVA_HOME"),
+             os.path.join(os.environ.get("APPDATA", ""), "Polyfrost",
+                          "OneClient", "metadata", "java")]
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        for root, _dirs, files in os.walk(base):
+            if "jcmd.exe" in files:
+                candidates.append(os.path.join(root, "jcmd.exe"))
+                break
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def load_library_and_agent(pid, raw):
+    """Грузит DLL через LoadLibraryA и дополнительно регистрирует её JVMTI-агентом.
+
+    Один и тот же файловый модуль используется и для оверлея, и для агента:
+    JVMTI.agent_load вызовет Agent_OnAttach в уже загруженном модуле, поэтому
+    DllMain и хуки оверлея не выполняются второй раз.
+    """
+    path = os.path.join(tempfile.gettempdir(), "ovl_payload.dll")
+    with open(path, "wb") as f:
+        f.write(raw)
+    hproc = kernel32.OpenProcess(
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION |
+        PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+        False, pid)
+    if not hproc:
+        raise RuntimeError("OpenProcess: %d (запусти Python от администратора)"
+                           % ctypes.get_last_error())
+    try:
+        modules = enum_modules(pid)
+        remote_load_library(hproc, pid, modules, path)
+    finally:
+        kernel32.CloseHandle(hproc)
+    print("[+] DLL загружена через LoadLibraryA: %s" % path, flush=True)
+
+    jcmd = find_jcmd(pid)
+    if not jcmd:
+        print("[!] jcmd.exe не найден - JVMTI-хук тика будет недоступен", flush=True)
+        return
+    try:
+        result = subprocess.run(
+            [jcmd, str(pid), "JVMTI.agent_load", path],
+            capture_output=True, text=True, timeout=15)
+        out = (result.stdout or result.stderr or "").strip()
+        if out:
+            print("[+] jcmd: %s" % out, flush=True)
+        if result.returncode != 0:
+            print("[!] JVMTI.agent_load вернул %d" % result.returncode, flush=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        print("[!] JVMTI.agent_load: %s" % e, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Map an x64 DLL into a process (memory only, no files)")
@@ -854,7 +926,7 @@ def main():
             with open(dll, "rb") as f:
                 raw = f.read()
         print("[*] Получено %d байт" % len(raw))
-        manual_map(pid, raw)
+        load_library_and_agent(pid, raw)
     except (ValueError, RuntimeError, OSError) as e:
         die(str(e))
 
